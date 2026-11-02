@@ -42,17 +42,43 @@
     }
   }
 
+  /* запасной канал: функция moex-proxy в том же проекте Supabase.
+     Если адрес не указан в config.js, берём его из адреса Supabase. */
+  function proxyUrl() {
+    const c = cfg();
+    if (c.moexProxyUrl) return c.moexProxyUrl;
+    if (c.supabaseUrl) return c.supabaseUrl.replace(/\/+$/, '') + '/functions/v1/moex-proxy';
+    return null;
+  }
+  M.proxyUrl = proxyUrl;
+
   async function fetchISS(path) {
-    const proxy = cfg().moexProxyUrl;
+    const proxy = proxyUrl();
     const prefer = U.lsGet('kk:moexVia', 'direct');
-    const direct = () => fetchJSON(BASE + path).then((d) => ({ d, via: 'direct' }));
+    const errs = {};
+    const direct = () =>
+      fetchJSON(BASE + path)
+        .then((d) => ({ d, via: 'direct' }))
+        .catch((e) => {
+          errs.direct = e;
+          throw e;
+        });
     const viaProxy = () => {
-      if (!proxy) return Promise.reject(new Error('Прокси не настроен'));
+      if (!proxy) return Promise.reject((errs.proxy = new Error('нет адреса')));
       const sep = proxy.includes('?') ? '&' : '?';
-      return fetchJSON(proxy + sep + 'path=' + encodeURIComponent(path)).then((d) => ({ d, via: 'proxy' }));
+      const key = cfg().supabaseAnonKey;
+      const headers = key && /^eyJ/.test(key) ? { apikey: key, Authorization: 'Bearer ' + key } : key ? { apikey: key } : {};
+      return fetchJSON(proxy + sep + 'path=' + encodeURIComponent(path), { headers })
+        .then((d) => {
+          if (d && d.error && !d.securities && !d.description) throw new Error(d.error);
+          return { d, via: 'proxy' };
+        })
+        .catch((e) => {
+          errs.proxy = e;
+          throw e;
+        });
     };
     const order = prefer === 'proxy' && proxy ? [viaProxy, direct] : [direct, viaProxy];
-    let err;
     for (const f of order) {
       try {
         const res = await f();
@@ -60,11 +86,17 @@
         setStatus({ ok: true, via: res.via, lastError: null, lastFetch: Date.now() });
         return res.d;
       } catch (e) {
-        err = e;
+        /* пробуем следующий путь */
       }
     }
-    setStatus({ ok: false, lastError: err ? err.message : 'нет связи' });
-    throw err || new Error('Мосбиржа недоступна');
+    const pe = errs.proxy ? errs.proxy.message : '';
+    let msg;
+    if (!proxy) msg = 'браузер не пускает к Мосбирже напрямую, а запасной канал не настроен';
+    else if (/404/.test(pe)) msg = 'браузер не пускает к Мосбирже напрямую, а функция moex-proxy в Supabase ещё не создана';
+    else if (/401|403/.test(pe)) msg = 'функция moex-proxy в Supabase просит вход: выключите у неё проверку JWT';
+    else msg = 'Мосбиржа не отвечает ни напрямую, ни через Supabase' + (pe ? ' (' + pe + ')' : '');
+    setStatus({ ok: false, lastError: msg });
+    throw new Error(msg);
   }
 
   async function get(path, ttl, { force } = {}) {
